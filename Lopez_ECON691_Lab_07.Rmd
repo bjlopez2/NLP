@@ -1,0 +1,307 @@
+---
+title: "Lopez_ECON691_Lab07"
+author: "Brian Lopez"
+date: "11/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+## Lab 07
+
+```{r, eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE}
+library(plyr)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(textclean)
+library(tm)
+library(maps)
+library(textstem)
+library(Rcpp)
+library(text2vec)
+library(tidytext)
+library(widyr)
+library(irlba)
+library(Matrix)
+library(stm)
+library(caret)
+library(e1071)
+library(LiblineaR)
+library(naivebayes)
+library(caTools)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Load NLP environment
+load_NLP_env <- function(func_dir){
+  
+  set.seed(1234567890)
+  
+  options(stringsAsFactors = F)
+  
+  packages <- c(
+    "plyr",
+    "dplyr",
+    "reshape2",
+    "ggplot2",
+    "textclean",
+    "tm",
+    "maps",
+    "Rcpp",
+    "text2vec",
+    "tidytext",
+    "widyr",
+    "irlba",
+    "Matrix",
+    "stm",
+    "textstem"
+  )
+  
+  # install packages if they don't exist
+  new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+  if(length(new_packages)) {install.packages(new_packages)}
+  
+  # load packages
+  sapply(packages, library, character.only = TRUE)
+  
+  print(paste("packages loaded: ", paste(packages, collapse = ", ")))
+  
+  # load functions library
+  for (i in list.files(func_dir, pattern = "\\.[RrSsQq]$", recursive = TRUE)) {
+    source(file.path(func_dir, i))
+  }
+  
+  print(paste("functions loaded: ", paste(unlist(list.files(func_dir, pattern = "\\.[RrSsQq]$", recursive = TRUE)),
+                                    collapse = ", ")))
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Load Preprocessing function
+pre_process_corpus <- function(data, text_col, remove_html = TRUE, replace_emojis = FALSE, replace_numbers = FALSE,
+                               replace_strings = NULL, remove_strings = NULL, non_stopwords = NULL,
+                               extra_stopwords = NULL, root_gen = NULL, output_corpus = FALSE){
+  
+  text <- data[, text_col]
+  
+  # remove html encoding
+  if(remove_html == T){
+    text <- gsub("&gt;|&lt;"," ", text, perl = TRUE)
+    text <- gsub("<[^>]*>", " ", text, perl = TRUE)
+  }
+  
+  # remove hex encoding
+  if(remove_html == T){
+    text <- gsub("[\x80-\xff]", " ", text)
+    text <- gsub("&quot;|&#x2F;", " ", text, perl = TRUE)
+    text <- gsub("&#x2F;","/", text, perl = TRUE)
+  }
+  
+  # replacing contractions
+  text <- replace_contraction(text)
+  
+  # replace emojis
+  if(replace_emojis == T){
+    text <- replace_emoji(text)
+  }
+  
+  # replace numbers
+  if(replace_numbers == T){
+    text <- replace_number(text)
+  }
+  
+  # converting all text to lower case
+  text <- tolower(text)
+  
+  # removing non-ascii characters
+  text <- gsub("[^\001-\177]",'', text, perl = TRUE)
+  
+  # replace specific strings
+  if(!is.null(replace_strings)){
+    old_str <- replace_strings[1:(length(replace_strings)/2)]
+    new_str <- replace_strings[((length(replace_strings)/2) +1):length(replace_strings)]
+    for(i in 1:length(old_str)){text <- gsub(old_str[i], new_str[i], text)}
+  }
+  
+  # removing specific strings
+  if(!is.null(remove_strings)){
+    strs <- paste(remove_strings, collapse = "|")
+    
+    text <- strsplit(text, " ")
+    text <- unlist(lapply(text, function(x) {
+      paste(x[!grepl(strs, x)], collapse = " ")
+    }))
+  }
+  
+  # converting to volatile corpus
+  text <- VCorpus(VectorSource(text))
+  
+  # removing terms from stopword dictionary
+  stopwords <- stopwords()
+  stopwords <- stopwords[which(!stopwords %in% non_stopwords)]
+  
+  # adding stopwords
+  stopwords <- c(stopwords,extra_stopwords)
+  
+  # removing stopwords
+  text <- tm_map(text, function(x) {removeWords(x,stopwords)})
+  
+  # removing punctuation, numbers, and whitespace
+  text <- tm_map(text, function(x) {removePunctuation(x)})
+  text <- tm_map(text, function(x) {removeNumbers(x)})
+  text <- tm_map(text, function(x) {stripWhitespace(x)})
+  
+  # generating term roots
+  if(!is.null(root_gen)){
+    if(root_gen == 'stem'){
+      text <- ldply(lapply(text, function(x) {stem_strings(x$content)}), rbind)[, 2]
+      text <- VCorpus(VectorSource(text))
+    }
+    
+    if(root_gen == 'lemmatize'){
+      text <- ldply(lapply(text, function(x) {lemmatize_strings(x$content)}), rbind)[, 2]
+      text <- VCorpus(VectorSource(text))
+    }
+  }
+  
+  if(output_corpus == TRUE){
+   return(text)
+  } else {return(unlist(lapply(text, function(x){x$content})))}
+  
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Load data 
+enron <- read.csv('C:/Users/bjlop/Downloads/enron_emails_labeled.csv')
+colnames(enron)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Preprocess text
+text <- pre_process_corpus(enron, "body", root_gen = 'lemmatize')
+
+enron$body_preprocessed <- text
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Create train/test sets
+rand <- runif(nrow(enron))
+sets <- ifelse(rand < 0.9, 'train', 'test')
+enron$set <- sets 
+
+train <- enron[enron$set == 'train',]
+
+# Tokenize and create vocabulary
+it_train <- itoken(train$body_preprocessed,
+                   tokenizer = word_tokenizer, ids = train$email_id)
+vocab <- create_vocabulary(it_train, ngram = c(1, 3))
+
+lbound <- round(0.009 * nrow(train))
+ubound <- nrow(train) - lbound
+
+vocab <- vocab[vocab$doc_count > lbound & vocab$doc_count < ubound,]
+
+vectorizer <- vocab_vectorizer(vocab)
+dtm_train <- create_dtm(it_train, vectorizer)
+
+test <- enron[enron$set == 'test',]
+it_test <- itoken(test$body_preprocessed,
+                   tokenizer = word_tokenizer, ids = test$email_id)
+
+dtm_test <- create_dtm(it_test, vectorizer)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Model
+library(caret)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Tune model for custom f beta function
+calc_f5 <- function(data, lev = NULL, model = NULL){
+  recall <- nrow(data[data[, "obs"] == 1 & data[, "pred"] == 1,])/
+    nrow(data[data[, "obs"] == 1,])
+  precision <- nrow(data[data[, "obs"] == 1 & data[, "pred"] == 1,])/
+    nrow(data[data[, "pred"] == 1,])
+  out <- (1 + 5^2)*(precision * recall)/((5^2 * precision) + recall)
+  names(out) <- 'f5'
+  out
+}
+
+trctrl <- trainControl(method = "repeatedcv", number = 3, repeats = 3, summaryFunction = calc_f5)
+```
+
+```{r, message=FALSE, warning=FALSE}
+#expand.grid(cost=c(0, 0.5, 1), Loss = c(0, 1), weight = c(0,1))
+```
+
+```{r, message=FALSE, warning=FALSE}
+library(LiblineaR)
+
+enron_svm <- train(x = as.matrix(dtm_train),
+                 y = as.factor(train$company_business),
+                 method = "svmLinearWeights2",
+                 trControl = trctrl,
+                 tuneGrid = data.frame(cost = 1, Loss = 0, weight = 1))
+
+pred_test <- predict(enron_svm, as.matrix(dtm_test))
+
+preds <- data.frame(id = enron$email_id[enron$set == "test"], 
+                    label = enron$company_business[enron$set == "test"],
+                    svm = as.numeric(as.character(pred_test)))
+
+f5_svm <- calc_fbeta(preds, "label", 1, "svm", 1, 5)
+f5_svm
+
+table(preds$label, preds$svm)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Naive-Bayes
+library(naivebayes)
+
+model_nb <- train(x = as.matrix(dtm_train),
+                y = as.factor(train$company_business),
+                method = "naive_bayes",
+                trControl = trctrl,
+                tuneGrid = data.frame(laplace = 0, usekernel = FALSE, adjust = FALSE))
+
+pred_test <- predict(model_nb, as.matrix(dtm_test))
+
+preds$nb <- as.numeric(as.character(pred_test))
+
+f5_nb <- calc_fbeta(preds, "label", 1, "nb", 1, 5)
+f5_nb
+
+table(preds$label, preds$nb)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Random Forest
+library(caTools)
+
+model_rf <- train(as.matrix(dtm_train),
+            y = as.factor(train$company_business),
+            method = "ranger",
+            trControl = trctrl,
+            tuneGrid = data.frame(mtry = floor(sqrt(dim(as.matrix(dtm_train))[2])),
+                            splitrule = "gini",
+                            min.node.size = 1))
+
+pred_test <- predict(model_rf, as.matrix(dtm_test))
+
+preds$rf <- as.numeric(as.character(pred_test))
+
+f5_rf <- calc_fbeta(preds, "label", 1, "rf", 1, 5)
+f5_rf
+```
+
+The random forest by far perfomed the best among our support vector machine (svm) model, naive-bayes model, and random forest model. This is while optimizing for f score, meaning we are prioritizing the correct labeling of true negatives rather than true positives. For this specific case, we are much more concerned with false negatives (ie, mistakenly discarding a document that should have been kept) than false positives (keeping a document that should not have been kept). Therefore, the model’s performance would be better evaluated with a metric that values recall significantly more than precision. Using my best model (Random Forest), my estimated error cost per 100 dosuments is 4,000 dollars.
+
+Note: The company estimates that a document that should have been stored but was discarded costs them 200 dollars in lost potential value, and a document that should have been discarded but was stored costs 40 dollars in administration, storage, and review.
+
+
